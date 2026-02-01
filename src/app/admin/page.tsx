@@ -2783,9 +2783,15 @@ const TVBoxSubscriptionPanel = ({
 const VideoSourceConfig = ({
   config,
   refreshConfig,
+  storageMode,
+  updateConfig,
 }: {
   config: AdminConfig | null;
   refreshConfig: () => Promise<void>;
+  storageMode: 'cloud' | 'local';
+  updateConfig: (
+    updater: (prev: AdminConfig | null) => AdminConfig | null,
+  ) => void;
 }) => {
   const { alertModal, showAlert, hideAlert } = useAlertModal();
   const { isLoading, withLoading } = useLoadingState();
@@ -2886,8 +2892,103 @@ const VideoSourceConfig = ({
     }
   }, [config]);
 
+  // 本地模式下直接更新配置
+  const updateSourceConfigLocally = (
+    action: string,
+    payload: Record<string, any>,
+  ) => {
+    updateConfig((prev) => {
+      if (!prev) return prev;
+      const sources = [...(prev.SourceConfig || [])];
+
+      switch (action) {
+        case 'add': {
+          const newSource: DataSource = {
+            key: payload.key,
+            name: payload.name,
+            api: payload.api,
+            detail: payload.detail || '',
+            disabled: false,
+            is_adult: payload.is_adult || false,
+            from: 'custom',
+          };
+          sources.push(newSource);
+          break;
+        }
+        case 'delete': {
+          const idx = sources.findIndex((s) => s.key === payload.key);
+          if (idx !== -1) sources.splice(idx, 1);
+          break;
+        }
+        case 'enable': {
+          const source = sources.find((s) => s.key === payload.key);
+          if (source) source.disabled = false;
+          break;
+        }
+        case 'disable': {
+          const source = sources.find((s) => s.key === payload.key);
+          if (source) source.disabled = true;
+          break;
+        }
+        case 'update_adult': {
+          const source = sources.find((s) => s.key === payload.key);
+          if (source) source.is_adult = payload.is_adult;
+          break;
+        }
+        case 'sort': {
+          if (payload.order && Array.isArray(payload.order)) {
+            const orderMap = new Map(
+              payload.order.map((key: string, idx: number) => [key, idx]),
+            );
+            sources.sort((a, b) => {
+              const aIdx = orderMap.get(a.key) ?? 999;
+              const bIdx = orderMap.get(b.key) ?? 999;
+              return aIdx - bIdx;
+            });
+          }
+          break;
+        }
+        case 'batch_enable': {
+          payload.keys?.forEach((key: string) => {
+            const source = sources.find((s) => s.key === key);
+            if (source) source.disabled = false;
+          });
+          break;
+        }
+        case 'batch_disable': {
+          payload.keys?.forEach((key: string) => {
+            const source = sources.find((s) => s.key === key);
+            if (source) source.disabled = true;
+          });
+          break;
+        }
+        case 'batch_delete': {
+          payload.keys?.forEach((key: string) => {
+            const idx = sources.findIndex((s) => s.key === key);
+            if (idx !== -1) sources.splice(idx, 1);
+          });
+          break;
+        }
+      }
+
+      return { ...prev, SourceConfig: sources };
+    });
+  };
+
   // 通用 API 请求
   const callSourceApi = async (body: Record<string, any>) => {
+    // 本地模式：直接更新配置，不调用 API
+    if (storageMode === 'local') {
+      updateSourceConfigLocally(body.action, body);
+      showAlert({
+        type: 'success',
+        title: '操作成功',
+        message: '配置已保存到本地',
+        timer: 2000,
+      });
+      return;
+    }
+
     try {
       const resp = await fetch('/api/admin/source', {
         method: 'POST',
@@ -4764,9 +4865,15 @@ const CategoryConfig = ({
 const ConfigFileComponent = ({
   config,
   refreshConfig,
+  storageMode,
+  updateConfig,
 }: {
   config: AdminConfig | null;
   refreshConfig: () => Promise<void>;
+  storageMode: 'cloud' | 'local';
+  updateConfig: (
+    updater: (prev: AdminConfig | null) => AdminConfig | null,
+  ) => void;
 }) => {
   const { alertModal, showAlert, hideAlert } = useAlertModal();
   const { isLoading, withLoading } = useLoadingState();
@@ -4823,6 +4930,100 @@ const ConfigFileComponent = ({
     });
   };
 
+  // 本地模式：解析配置文件并更新源配置
+  const parseAndApplyConfigFile = (configFileContent: string) => {
+    interface ConfigFileStruct {
+      api_site?: {
+        [key: string]: {
+          key?: string;
+          api: string;
+          name: string;
+          detail?: string;
+          is_adult?: boolean;
+        };
+      };
+      custom_category?: {
+        name?: string;
+        type: 'movie' | 'tv';
+        query: string;
+      }[];
+      lives?: {
+        [key: string]: { name: string; url: string; ua?: string; epg?: string };
+      };
+    }
+
+    let parsed: ConfigFileStruct = {};
+    try {
+      if (configFileContent && configFileContent.trim()) {
+        parsed = JSON.parse(configFileContent);
+      }
+    } catch {
+      // 解析失败时使用空对象
+    }
+
+    updateConfig((prev) => {
+      if (!prev) return prev;
+
+      // 保留自定义源（from !== 'config'）
+      const customSources = (prev.SourceConfig || []).filter(
+        (s) => s.from !== 'config',
+      );
+      const customCategories = (prev.CustomCategories || []).filter(
+        (c) => c.from !== 'config',
+      );
+      const customLives = (prev.LiveConfig || []).filter(
+        (l) => l.from !== 'config',
+      );
+
+      // 从配置文件解析新的预设源
+      const configSources = Object.entries(parsed.api_site || {}).map(
+        ([key, site]) => ({
+          key,
+          name: site.name,
+          api: site.api,
+          detail: site.detail,
+          is_adult: site.is_adult || false,
+          from: 'config' as const,
+          disabled: false,
+        }),
+      );
+
+      const configCategories = (parsed.custom_category || []).map((cat) => ({
+        name: cat.name || cat.query,
+        type: cat.type,
+        query: cat.query,
+        from: 'config' as const,
+        disabled: false,
+      }));
+
+      const configLives = Object.entries(parsed.lives || {}).map(
+        ([key, live]) => ({
+          key,
+          name: live.name,
+          url: live.url,
+          ua: live.ua,
+          epg: live.epg,
+          channelNumber: 0,
+          from: 'config' as const,
+          disabled: false,
+        }),
+      );
+
+      return {
+        ...prev,
+        ConfigFile: configFileContent,
+        ConfigSubscribtion: {
+          URL: subscriptionUrl,
+          AutoUpdate: autoUpdate,
+          LastCheck: lastCheckTime || new Date().toISOString(),
+        },
+        SourceConfig: [...configSources, ...customSources],
+        CustomCategories: [...configCategories, ...customCategories],
+        LiveConfig: [...configLives, ...customLives],
+      };
+    });
+  };
+
   // 保存配置文件
   const handleSave = async () => {
     // 检查是否要清空配置
@@ -4850,6 +5051,25 @@ const ConfigFileComponent = ({
     }
 
     await withLoading('saveConfig', async () => {
+      // 本地模式：直接解析并更新配置
+      if (storageMode === 'local') {
+        parseAndApplyConfigFile(configContent);
+        if (
+          isEmpty &&
+          (config?.SourceConfig?.filter((s) => s.from === 'config').length ??
+            0) > 0
+        ) {
+          showSuccess(
+            '配置文件已清空，系统预设视频源已删除，自定义源已保留',
+            showAlert,
+          );
+        } else {
+          showSuccess('配置文件保存成功', showAlert);
+        }
+        return;
+      }
+
+      // 云端模式：调用 API
       try {
         const resp = await fetch('/api/admin/config_file', {
           method: 'POST',
@@ -5602,9 +5822,15 @@ const SiteConfigComponent = ({
 const LiveSourceConfig = ({
   config,
   refreshConfig,
+  storageMode,
+  updateConfig,
 }: {
   config: AdminConfig | null;
   refreshConfig: () => Promise<void>;
+  storageMode: 'cloud' | 'local';
+  updateConfig: (
+    updater: (prev: AdminConfig | null) => AdminConfig | null,
+  ) => void;
 }) => {
   const { alertModal, showAlert, hideAlert } = useAlertModal();
   const { isLoading, withLoading } = useLoadingState();
@@ -5648,8 +5874,88 @@ const LiveSourceConfig = ({
     }
   }, [config]);
 
+  // 本地模式下直接更新配置
+  const updateLiveConfigLocally = (
+    action: string,
+    payload: Record<string, any>,
+  ) => {
+    updateConfig((prev) => {
+      if (!prev) return prev;
+      const sources = [...(prev.LiveConfig || [])];
+
+      switch (action) {
+        case 'add': {
+          const newSource: LiveDataSource = {
+            key: payload.key,
+            name: payload.name,
+            url: payload.url,
+            ua: payload.ua || '',
+            epg: payload.epg || '',
+            disabled: false,
+            from: 'custom',
+            channelNumber: 0,
+          };
+          sources.push(newSource);
+          break;
+        }
+        case 'delete': {
+          const idx = sources.findIndex((s) => s.key === payload.key);
+          if (idx !== -1) sources.splice(idx, 1);
+          break;
+        }
+        case 'enable': {
+          const source = sources.find((s) => s.key === payload.key);
+          if (source) source.disabled = false;
+          break;
+        }
+        case 'disable': {
+          const source = sources.find((s) => s.key === payload.key);
+          if (source) source.disabled = true;
+          break;
+        }
+        case 'update': {
+          const source = sources.find((s) => s.key === payload.key);
+          if (source) {
+            source.name = payload.name ?? source.name;
+            source.url = payload.url ?? source.url;
+            source.ua = payload.ua ?? source.ua;
+            source.epg = payload.epg ?? source.epg;
+          }
+          break;
+        }
+        case 'sort': {
+          if (payload.order && Array.isArray(payload.order)) {
+            const orderMap = new Map(
+              payload.order.map((key: string, idx: number) => [key, idx]),
+            );
+            sources.sort((a, b) => {
+              const aIdx = orderMap.get(a.key) ?? 999;
+              const bIdx = orderMap.get(b.key) ?? 999;
+              return aIdx - bIdx;
+            });
+          }
+          break;
+        }
+      }
+
+      return { ...prev, LiveConfig: sources };
+    });
+  };
+
   // 通用 API 请求
   const callLiveSourceApi = async (body: Record<string, any>) => {
+    // 本地模式：直接更新配置，不调用 API
+    if (storageMode === 'local') {
+      updateLiveConfigLocally(body.action, body);
+      showAlert({
+        type: 'success',
+        title: '操作成功',
+        message: '配置已保存到本地',
+        timer: 2000,
+      });
+      return;
+    }
+
     try {
       const resp = await fetch('/api/admin/live', {
         method: 'POST',
@@ -6331,12 +6637,40 @@ function AdminPageClient() {
     [loadLocalConfig],
   );
 
-  // 当配置变化且是本地模式时，自动同步到 localStorage
+  // 同步配置到后端内存（本地模式专用）
+  const syncConfigToBackend = useCallback(async (configToSync: AdminConfig) => {
+    try {
+      const response = await fetch('/api/admin/config/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ config: configToSync }),
+      });
+      if (!response.ok) {
+        console.warn('同步配置到后端失败');
+      } else {
+        console.log('[本地模式] 配置已同步到后端内存');
+      }
+    } catch (e) {
+      console.warn('同步配置到后端失败:', e);
+    }
+  }, []);
+
+  // 当配置变化且是本地模式时，自动同步到 localStorage 和后端
   useEffect(() => {
     if (storageMode === 'local' && config) {
       saveLocalConfig(config);
+      // 同时同步到后端内存，确保搜索和播放功能正常工作
+      syncConfigToBackend(config);
     }
-  }, [config, storageMode, saveLocalConfig]);
+  }, [config, storageMode, saveLocalConfig, syncConfigToBackend]);
+
+  // 直接更新配置（用于本地模式下的子组件）
+  const updateConfig = useCallback(
+    (updater: (prev: AdminConfig | null) => AdminConfig | null) => {
+      setConfig(updater);
+    },
+    [],
+  );
 
   useEffect(() => {
     // 首次加载时显示骨架
@@ -6649,6 +6983,8 @@ function AdminPageClient() {
               <ConfigFileComponent
                 config={config}
                 refreshConfig={fetchConfig}
+                storageMode={storageMode}
+                updateConfig={updateConfig}
               />
             </CollapsibleTab>
           )}
@@ -6712,7 +7048,12 @@ function AdminPageClient() {
               isExpanded={expandedTabs.videoSource}
               onToggle={() => toggleTab('videoSource')}
             >
-              <VideoSourceConfig config={config} refreshConfig={fetchConfig} />
+              <VideoSourceConfig
+                config={config}
+                refreshConfig={fetchConfig}
+                storageMode={storageMode}
+                updateConfig={updateConfig}
+              />
             </CollapsibleTab>
 
             {/* 直播源配置标签 */}
@@ -6724,7 +7065,12 @@ function AdminPageClient() {
               isExpanded={expandedTabs.liveSource}
               onToggle={() => toggleTab('liveSource')}
             >
-              <LiveSourceConfig config={config} refreshConfig={fetchConfig} />
+              <LiveSourceConfig
+                config={config}
+                refreshConfig={fetchConfig}
+                storageMode={storageMode}
+                updateConfig={updateConfig}
+              />
             </CollapsibleTab>
 
             {/* TVbox 配置 */}
